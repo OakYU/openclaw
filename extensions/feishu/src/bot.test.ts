@@ -2567,6 +2567,7 @@ describe("handleFeishuMessage command authorization", () => {
       message: {
         message_id: "om_topic_followup_allowlisted",
         root_id: "om_topic_root",
+        thread_id: "omt_topic_1",
         chat_id: "oc-group",
         chat_type: "group",
         message_type: "text",

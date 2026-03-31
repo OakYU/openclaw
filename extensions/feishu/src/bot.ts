@@ -823,6 +823,7 @@ export async function handleFeishuMessage(params: {
       }
     >();
     let rootMessageInfo: Awaited<ReturnType<typeof getMessageFeishu>> | undefined;
+    let rootMessageThreadId: string | undefined;
     let rootMessageFetched = false;
     const getRootMessageInfo = async () => {
       if (!ctx.rootId) {
@@ -844,6 +845,7 @@ export async function handleFeishuMessage(params: {
             rootMessageInfo = null;
           }
         }
+        rootMessageThreadId = rootMessageInfo?.threadId;
         if (
           rootMessageInfo &&
           !shouldIncludeFetchedGroupContextMessage({
@@ -897,7 +899,7 @@ export async function handleFeishuMessage(params: {
       }
 
       const rootMsg = await getRootMessageInfo();
-      let feishuThreadId = ctx.threadId ?? rootMsg?.threadId;
+      let feishuThreadId = ctx.threadId ?? rootMessageThreadId ?? rootMsg?.threadId;
       if (feishuThreadId) {
         log(`feishu[${account.accountId}]: resolved thread ID: ${feishuThreadId}`);
       }
