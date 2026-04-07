@@ -16,6 +16,7 @@ import { logVerbose } from "../../globals.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { defaultRuntime } from "../../runtime.js";
+import { splitByReplyToTags } from "../../utils/directive-tags.js";
 import { isInternalMessageChannel } from "../../utils/message-channel.js";
 import { stripHeartbeatToken } from "../heartbeat.js";
 import type { OriginatingChannelType } from "../templating.js";
@@ -29,6 +30,7 @@ import {
   resolveOriginMessageTo,
 } from "./origin-routing.js";
 import { refreshQueuedFollowupSession, type FollowupRun } from "./queue.js";
+import { shouldSuppressReasoningPayload } from "./reply-payloads-base.js";
 import {
   applyReplyThreading,
   filterMessagingToolDuplicates,
@@ -331,23 +333,93 @@ export function createFollowupRunner(params: {
         }
         return [{ ...payload, text: stripped.text }];
       });
+      const nonReasoningPayloads = sanitizedPayloads.filter(
+        (p) => !shouldSuppressReasoningPayload(p),
+      );
+
+      // --- Multi-tag payload splitting ---
+      // When the LLM uses multiple [[reply_to:<id>]] tags in a single payload,
+      // split that payload into one segment per tag so each reply targets the
+      // correct message.
+      let didMultiTagSplit = false;
+      const multiTagPayloads = nonReasoningPayloads.flatMap((payload) => {
+        const text = payload.text;
+        if (!text || !text.includes("[[reply_to")) {
+          return [payload];
+        }
+        const segments = splitByReplyToTags(text);
+        if (segments.length <= 1) {
+          return [payload];
+        }
+        didMultiTagSplit = true;
+        return segments.map((seg) => ({
+          ...payload,
+          text: seg.text,
+          replyToId: seg.replyToId,
+          replyToCurrent: seg.replyToCurrent,
+        }));
+      });
+
       const replyToChannel = resolveOriginMessageProvider({
         originatingChannel: queued.originatingChannel,
         provider: queued.run.messageProvider,
       }) as OriginatingChannelType | undefined;
-      const replyToMode = resolveReplyToMode(
+      const rawReplyToMode = resolveReplyToMode(
         queued.run.config,
         replyToChannel,
         queued.originatingAccountId,
         queued.originatingChatType,
       );
 
+      // --- Collected messageId enrichment ---
+      // When the drain collected N messages and the model produced N payloads,
+      // assign each payload its corresponding collected messageId.  This is
+      // more reliable than depending on the model to produce [[reply_to:...]]
+      // tags, because tags can be stripped during streaming or the model may
+      // omit them.  Model-produced replyToId takes precedence when present.
+      const collectedIds = queued.collectedMessageIds;
+      const hasCollectedMapping =
+        rawReplyToMode === "auto" &&
+        collectedIds &&
+        multiTagPayloads.length === collectedIds.length;
+      const collectedPayloads = hasCollectedMapping
+        ? multiTagPayloads.map((p, i) =>
+            p.replyToId ? p : { ...p, replyToId: collectedIds[i], replyToCurrent: true },
+          )
+        : multiTagPayloads;
+
+      // Followup runs are always queued work — "auto" resolves to "first".
+      // When collected mapping, multi-tag splitting, or the model itself
+      // produced multiple payloads with explicit replyToId targets, use "all"
+      // so each payload keeps its own replyToId.
+      const hasMultipleExplicitTargets = collectedPayloads.filter((p) => p.replyToId).length > 1;
+      const useAllMode = hasCollectedMapping || didMultiTagSplit || hasMultipleExplicitTargets;
+      const replyToMode =
+        rawReplyToMode === "auto" ? (useAllMode ? "all" : "first") : rawReplyToMode;
+
+      // When "auto" resolved to "first" (single queued message, no batch),
+      // inject replyToId + replyToCurrent on every payload — same as if
+      // the model had used [[reply_to_current]].
+      // Skip payloads that already have an explicit replyToId so the LLM's
+      // per-message targeting takes precedence over auto injection.
+      const threadingPayloads =
+        replyToMode === "first" && rawReplyToMode === "auto" && queued.messageId
+          ? collectedPayloads.map((p) =>
+              p.replyToId
+                ? p
+                : {
+                    ...p,
+                    replyToId: queued.messageId,
+                    replyToCurrent: true,
+                  },
+            )
+          : collectedPayloads;
       const replyTaggedPayloads: ReplyPayload[] = applyReplyThreading({
-        payloads: sanitizedPayloads,
+        payloads: threadingPayloads,
         replyToMode,
         replyToChannel,
+        currentMessageId: queued.messageId,
       });
-
       const dedupedPayloads = filterMessagingToolDuplicates({
         payloads: replyTaggedPayloads,
         sentTexts: runResult.messagingToolSentTexts ?? [],

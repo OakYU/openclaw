@@ -6,6 +6,7 @@ import { isSilentReplyPayloadText, SILENT_REPLY_TOKEN } from "../../../auto-repl
 import { formatToolAggregate } from "../../../auto-reply/tool-meta.js";
 import type { OpenClawConfig } from "../../../config/config.js";
 import { isCronSessionKey } from "../../../routing/session-key.js";
+import { splitByReplyToTags } from "../../../utils/directive-tags.js";
 import {
   BILLING_ERROR_USER_MESSAGE,
   formatAssistantErrorText,
@@ -275,26 +276,44 @@ export function buildEmbeddedRunPayloads(params: {
 
   let hasUserFacingAssistantReply = false;
   for (const text of answerTexts) {
-    const {
-      text: cleanedText,
-      mediaUrls,
-      audioAsVoice,
-      replyToId,
-      replyToTag,
-      replyToCurrent,
-    } = parseReplyDirectives(text);
-    if (!cleanedText && (!mediaUrls || mediaUrls.length === 0) && !audioAsVoice) {
-      continue;
+    // Split multi-tag responses into per-tag segments BEFORE stripping,
+    // so each segment becomes its own payload with the correct replyToId.
+    const segments = splitByReplyToTags(text);
+    const textsToProcess =
+      segments.length > 1
+        ? segments.map((seg) => {
+            // Re-attach the tag so parseReplyDirectives can extract it normally.
+            const tagPrefix = seg.replyToId
+              ? `[[reply_to:${seg.replyToId}]] `
+              : seg.replyToCurrent
+                ? "[[reply_to_current]] "
+                : "";
+            return `${tagPrefix}${seg.text}`;
+          })
+        : [text];
+
+    for (const segText of textsToProcess) {
+      const {
+        text: cleanedText,
+        mediaUrls,
+        audioAsVoice,
+        replyToId,
+        replyToTag,
+        replyToCurrent,
+      } = parseReplyDirectives(segText);
+      if (!cleanedText && (!mediaUrls || mediaUrls.length === 0) && !audioAsVoice) {
+        continue;
+      }
+      replyItems.push({
+        text: cleanedText,
+        media: mediaUrls,
+        audioAsVoice,
+        replyToId,
+        replyToTag,
+        replyToCurrent,
+      });
+      hasUserFacingAssistantReply = true;
     }
-    replyItems.push({
-      text: cleanedText,
-      media: mediaUrls,
-      audioAsVoice,
-      replyToId,
-      replyToTag,
-      replyToCurrent,
-    });
-    hasUserFacingAssistantReply = true;
   }
 
   if (params.lastToolError) {
